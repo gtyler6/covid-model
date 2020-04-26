@@ -1,10 +1,12 @@
 # covid-model
-Repo for COVID-19 outbreak Stan model and associated data, visualizations, EDA. 
+Repo for Stan model estimating true underlying cases and predicting spread of COVID-19, along with associated datasets, visualizations, EDA. 
+
 
 Outcomes data: 
-- Cases, deaths from NYT
-- Tests from Corona Data Scraper
-- Also have cases, deaths data available from Johns Hopkins and Corona Data Scraper
+- Cases, deaths from NYT: https://github.com/nytimes/covid-19-data
+- Tests from Corona Data Scraper: https://coronadatascraper.com/#home
+  + Also have cases and deaths data available
+- Also have cases, deaths data available from Johns Hopkins: 
 
 Population data: 
 - 2019 county population estimate from Census 
