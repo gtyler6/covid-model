@@ -281,6 +281,123 @@ df <- df %>%
 df <- df %>%
   mutate_at(vars(cases_adj_int.nyt, deaths_adj_int.nyt, tested_adj_int.cds), ~replace_na(., 0))
 
+# Create new daily amounts 
+df <- df %>% ungroup() %>%
+  mutate(new_cases_adj_int.nyt = cases_adj_int.nyt - lag(ifelse(is.na(cases_adj_int.nyt), 0, cases_adj_int.nyt))
+         , new_deaths_adj_int.nyt = deaths_adj_int.nyt - lag(ifelse(is.na(deaths_adj_int.nyt), 0, deaths_adj_int.nyt))
+         , new_tests_adj_int.cds = tested_adj_int.cds - lag(ifelse(is.na(tested_adj_int.cds),0,tested_adj_int.cds))
+         
+         , new_cases_adj.nyt = cases_adj.nyt - lag(cases_adj.nyt)
+         , new_deaths_adj.nyt = deaths_adj.nyt - lag(deaths_adj.nyt)
+         , new_tests_adj.cds = tested_adj.cds - lag(tested_adj.cds)
+
+         , new_cases.nyt = cases.nyt - lag(cases.nyt)
+         , new_deaths.nyt = deaths.nyt - lag(deaths.nyt)
+         , new_tests.cds = tested.cds - lag(tested.cds))
+
+# Import 2019 population estimates from census 
+pop_census <- read_csv("/Users/grahamtyler/Desktop/Github\ Repos/covid-model/census_2019_pop_estimate.csv")
+
+# Update FIPS to join data
+pop_census <- pop_census %>%
+  mutate(FIPS = paste0(as.character(ifelse(nchar(STATE) == 1, paste0("0", STATE), STATE)), 
+                       as.character(ifelse(nchar(COUNTY) == 1, paste0("00", COUNTY)
+                                           , ifelse(nchar(COUNTY) == 2, paste0("0", COUNTY), COUNTY)))))
+
+# Trim pop_census to relevant variables for future use
+pop_census <- pop_census %>%
+  select(STNAME, CTYNAME, FIPS
+         , POPESTIMATE2013, POPESTIMATE2014, POPESTIMATE2015, POPESTIMATE2016, POPESTIMATE2017, POPESTIMATE2018, POPESTIMATE2019
+         , NPOPCHG_2019
+         , BIRTHS2013, BIRTHS2014, BIRTHS2015, BIRTHS2016, BIRTHS2017, BIRTHS2018, BIRTHS2019
+         , DEATHS2013, DEATHS2014, DEATHS2015, DEATHS2016, DEATHS2017, DEATHS2018, DEATHS2019
+         , RDEATH2013, RDEATH2014, RDEATH2015, RDEATH2016, RDEATH2017, RDEATH2018, RDEATH2019
+         , NETMIG2013, NETMIG2014, NETMIG2015, NETMIG2016, NETMIG2017, NETMIG2018, NETMIG2019
+         , GQESTIMATES2019)
+
+# Check for anything in df not in pop_census. 
+anti_join(df, pop_census, by = "FIPS")
+
+# Check for anything in pop_census not in df. Should only be the 50 rows for state totals. 
+anti_join(pop_census, df, by = "FIPS")
+
+# Join on FIPS to get population data
+df <- df %>% left_join(select(pop_census, FIPS, POPESTIMATE2019), by = "FIPS")
+
+# Calculate per capita numbers. 
+df <- df %>%
+  mutate(cases_r.nyt = cases.nyt / POPESTIMATE2019
+         , cases_adj_r.nyt = cases_adj.nyt / POPESTIMATE2019
+         , cases_adj_int_r.nyt = cases_adj_int.nyt / POPESTIMATE2019
+         
+         , deaths_r.nyt = deaths.nyt / POPESTIMATE2019
+         , deaths_adj_r.nyt = deaths_adj.nyt / POPESTIMATE2019
+         , deaths_adj_int_r.nyt = deaths_adj_int.nyt / POPESTIMATE2019
+         
+         , tested_r.cds = tested.cds / POPESTIMATE2019
+         , tested_adj_r.cds = tested_adj.cds / POPESTIMATE2019
+         , tested_adj_int_r.cds = tested_adj_int.cds / POPESTIMATE2019
+         
+         , new_cases_r.nyt = new_cases.nyt / POPESTIMATE2019
+         , new_cases_adj_r.nyt = new_cases_adj.nyt / POPESTIMATE2019
+         , new_cases_adj_int_r.nyt = new_cases_adj_int.nyt / POPESTIMATE2019
+         
+         , new_deaths_r.nyt = new_deaths.nyt / POPESTIMATE2019
+         , new_deaths_adj_r.nyt = new_deaths_adj.nyt / POPESTIMATE2019
+         , new_deaths_adj_int_r.nyt = new_deaths_adj_int.nyt / POPESTIMATE2019
+         
+         , new_tests_r.cds = new_tests.cds / POPESTIMATE2019
+         , new_tests_adj_r.cds = new_tests_adj.cds / POPESTIMATE2019
+         , new_tests_adj_int_r.cds = new_tests_adj_int.cds / POPESTIMATE2019 )
+
+
+# Trim outcomes dataset to relevant variables
+outcomes <- df %>%
+  select(full_name, FIPS, state, county, date, pop_2019 = POPESTIMATE2019
+         # Case data: 
+         # Raw, incorrect data removed, and full data with interpolated values
+         # Cumulative total by day, new, per capita total, per capita new
+         , cases_raw = cases.nyt
+         , cases_adj = cases_adj.nyt
+         , cases_full = cases_adj_int.nyt
+         , new_cases_raw = new_cases.nyt
+         , new_cases_adj = new_cases_adj.nyt
+         , new_cases_full = new_cases_adj_int.nyt
+         , rate_cases_raw = cases_r.nyt 
+         , rate_cases_adj = cases_adj_r.nyt 
+         , rate_cases_full = cases_adj_int_r.nyt 
+         , r_new_cases_raw = new_cases_r.nyt 
+         , r_new_cases_adj = new_cases_adj_r.nyt 
+         , r_new_cases_full = new_cases_adj_int_r.nyt 
+         # Deaths data
+         , deaths_raw = deaths.nyt
+         , deaths_adj = deaths_adj.nyt
+         , deaths_full = deaths_adj_int.nyt
+         , new_deaths_raw = new_deaths.nyt
+         , new_deaths_adj = new_deaths_adj.nyt
+         , new_deaths_full = new_deaths_adj_int.nyt
+         , rate_deaths_raw = deaths_r.nyt 
+         , rate_deaths_adj = deaths_adj_r.nyt 
+         , rate_deaths_full = deaths_adj_int_r.nyt 
+         , r_new_deaths_raw = new_deaths_r.nyt 
+         , r_new_deaths_adj = new_deaths_adj_r.nyt 
+         , r_new_deaths_full = new_deaths_adj_int_r.nyt 
+         # Tests data
+         , tests_raw = tested.cds
+         , tests_adj = tested_adj.cds
+         , tests_full = tested_adj_int.cds
+         , new_tests_raw = new_tests.cds
+         , new_tests_adj = new_tests_adj.cds
+         , new_tests_full = new_tests_adj_int.cds
+         , rate_tests_raw = tested_r.cds 
+         , rate_tests_adj = tested_adj_r.cds 
+         , rate_tests_full = tested_adj_int_r.cds 
+         , r_new_tests_raw = new_tests_r.cds 
+         , r_new_tests_adj = new_tests_adj_r.cds 
+         , r_new_tests_full = new_tests_adj_int_r.cds )
+
+# Export to git directory
+write_csv(outcomes, paste0("/Users/grahamtyler/Desktop/Github\ Repos/covid-model/outcomes-",as.character(Sys.Date()),".csv"))
 
 
 
