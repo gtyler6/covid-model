@@ -1,0 +1,985 @@
+---
+title: "COVID Outcomes Data Comparison"
+author: "Graham Tyler"
+date: "4/21/2020"
+output: html_document
+---
+
+```{r setup, warning = F, message=FALSE}
+### knitr setup
+knitr::opts_chunk$set(
+  warning = F, 
+  message = F
+)
+
+### R setup
+
+library(tidyverse)
+library(zoo)
+library(sf)
+
+### Import data
+
+# Download time series data from Corona Data Scraper. 
+cds <- read_csv("/Users/grahamtyler/Downloads/timeseries-tidy 6.csv")
+
+# Note: We can pull updated version of this dataset directly through URL below, but it does not get parsed correctly and we lose the county and state names. 
+# cds <- read_csv(url("https://coronadatascraper.com/timeseries-tidy.csv"))
+
+# Download current US counties dataset from NYT github. 
+nyt <- read_csv(url("https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv"))
+
+# Download current US confirmed cases and US deaths datasets from Jonhs Hopkins github.
+jh_confirmed_us <- read_csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv"))
+
+jh_deaths_us <- read_csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv"))
+
+```
+
+## CDS data exploration and cleanup
+
+```{r}
+
+head(cds)
+
+```
+```{r}
+# Widen dataframe to create separate columns for cases, deaths, tests, etc. 
+cds <- cds %>% 
+  pivot_wider(names_from = type, values_from = value)
+
+# Filter to US only at the county level. 
+cds <- cds %>%
+  filter(country == "United States" & level == "county")
+
+# Check for missing data. 
+print(cds %>% summarise_all(funs(sum(is.na(.)))), width = Inf)
+```
+
+Data is mostly limited to cases and deaths, with some testing, recovered, active data. 
+One problem with CDS is that they don't provide the FIPS codes for there time series dataset, so initial join to other datasets will be on state, county, date. 
+
+```{r}
+# Check which places are missing location and population data. 
+
+cds %>%
+  group_by(name) %>%
+  filter(is.na(population) | is.na(lat) | is.na(long) | is.na(tz)) %>%
+  summarise(count = n())
+```
+
+Dukes and Nantucket county in MA has issues, which is true in most of the datasets because it seems to get recorded as two separate counties. 
+There are also the Economic Regions in AL, which seem to aggregate multiple areas listed separately as counties. AL is strange because it has "boroughs" and "municipalities" that get wrapped up into Economic Regions. 
+
+```{r}
+# Check the data for Dukes and Nantucket. 
+
+cds %>%
+  filter(grepl("Dukes", county)) %>%
+  group_by(name, county) %>%
+  summarise(count = n(), min(date), max(date), sum(cases, na.rm = TRUE), sum(deaths, na.rm = TRUE), max(cases, na.rm = TRUE), max(deaths, na.rm = TRUE))
+```
+
+There are lines for both "Dukes County" and "Dukes and Nantucket County". The first one has data for the full set of dates, but has fewer cases. It does not appear that these should be aggregated. Rather, we will just use the "Dukes County" entry, because it is more current and frequently updated. 
+
+```{r}
+cds <- cds %>% 
+  filter(name != "Dukes County, Nantucket County, Massachusetts, United States")
+
+# Also drop the Economic Region data. 
+cds <- cds %>%
+  filter(!grepl("Economic Region", name))
+
+# Check the missing case data. 
+cds %>% group_by(name) %>% 
+  filter(is.na(cases)) %>%
+  summarise(count = n())
+```
+
+All of the missing case data appears to be early on in DC. 
+```{r}
+# Drop these rows with no case data. 
+cds <- cds %>% drop_na(cases)
+```
+
+Missing deaths data should, in theory, only be for each county after it registers a case, but before it records a death. 
+```{r}
+# Pull counties with missing deaths data AFTER registering first death. 
+
+cds_death_na_dates <- cds %>% 
+  group_by(name, state, county) %>% 
+  summarise(last_na = max(date[which(is.na(deaths))])
+            , first_death = min(date[which(deaths > 0)])) %>%
+  filter(last_na > first_death)
+
+nrow(cds_death_na_dates)
+```
+
+There are a fair number of these cases, similar to the other datasets. Would need to impute these values. 
+
+```{r}
+# Check which entries have the most cases for a given day with NA or 0 deaths. 
+cds_death_case_check <- cds %>%
+  filter(is.na(deaths) | deaths == 0) %>%
+  arrange(desc(cases))
+
+head(cds_death_case_check)
+```
+
+Deaths data for counties around and including NYC is missing or 0, but cases are included for these counties. Also missing deaths for major NJ counties. 
+
+Therefore, this is NOT a good source for deaths. 
+
+```{r}
+# Run the same NA checks for the testing data
+
+cds_test_na_dates <- cds %>% group_by(name, state, county) %>% 
+  summarise(last_na = max(date[which(is.na(tested))])
+            , first_test = min(date[which(tested > 0)])
+            , na_count = sum(is.na(tested))) %>%
+  filter(last_na > first_test)
+
+nrow(cds_test_na_dates)
+
+
+#Again, there are a fair amount of counties with NA tests in the middle of the testing data. 
+#We will linearly interpolate tests for missing values by county later on. 
+
+
+
+#This doesn't really seem to be an issue. 
+```
+There are a fair amount of counties with missing testing data in the middle of the dataset after registering the first test. Revisit this after joining the datasets. 
+
+```{r}
+# Check if there are gaps in the dates for any counties. It should be that once cases/testing start, we have continuous entries each day. 
+cds %>% 
+  arrange(name, state, county, date) %>%
+  mutate(date_gap = date - lag(date)) %>%
+  filter(date_gap > 1)
+```
+
+This does not seem to be an issue. 
+
+## CDS Overview
+We will only use the CDS testing data, not the cases or deaths data. 
+
+The website indicates that these states have testing data by county from DOH in this dataset: AK, ND, NY, OR, TN, WI, and DC. 
+CA also has testing by county in the CDS dataset, but it is piecemeal from various sources saved in a spreadsheet. Ben Welsh at the LA Times indicated that DOH is not giving out testing by county in CA. 
+
+# End data checks and cleanup for CDS data. 
+
+
+## Johns Hopkins data exploration and cleanup
+```{r}
+# Generate character vector of dates corresponding to JH column names.
+dates <- str_remove(str_replace_all(as.character(format(seq.Date(as.Date("2020/1/22"), as.Date(Sys.Date()-1), by = "day"), "%m/%d/%y")), "/0", "/"), "^0+")
+
+# Lengthen JH datasets to have a row for each date for each county. 
+
+jh_confirmed_us <- jh_confirmed_us %>%
+  pivot_longer(cols = all_of(dates), names_to = "date", values_to = "cases")
+
+jh_deaths_us <- jh_deaths_us %>%
+  pivot_longer(cols = all_of(dates), names_to = "date", values_to = "deaths")
+
+# Combine the two JH datasets.
+
+jh <-jh_confirmed_us %>% left_join(select(jh_deaths_us, UID, date, Population, deaths), by = c("UID", "date"))
+
+# Check to make sure nothing is lost in the join. 
+anti_join(jh_confirmed_us, jh_deaths_us, by = c("UID", "date"))
+```
+
+Join seems to be fine. 
+
+```{r}
+head(jh)
+```
+
+
+```{r}
+# Check missing values. 
+print(jh %>% summarise_all(funs(sum(is.na(.)))), width = Inf)
+
+```
+```{r}
+# Check missing FIPS by county. 
+print(jh %>% filter(is.na(FIPS)) %>%
+  group_by(Province_State, Admin2) %>%
+  summarise(count = n()), n = Inf)
+
+```
+
+Dukes and Nantucket has issues. I think the Utah data is similar to AL -- regions aggregating counties, which we can ignore. 
+I'm not sure why Michigan prison data is separated out in this dataset. 
+
+
+Kansas City is part of four different counties. My understanding is that Kansas City, Missouri outcomes are being counted separately and the data for those counties is omitting KC data. This is fine for now, but we may need a workaround for mapping by county. 
+This seems to be consistent in all of the datasets. 
+
+```{r}
+# Check missing county name by FIPS. 
+print(jh %>% filter(is.na(Admin2)) %>%
+        group_by(Province_State, FIPS) %>%
+        summarise(count = n()), n = Inf)
+```
+
+Missing county name only seems to be an issue for territories and the data coded as being on a cruise ship, all of which we will ignore for now. 
+
+```{r}
+# Hard code a FIPS of 29000 for KC (which I've confirmed does not belong to any other county) and hard code Dukes and Nantucket FIPS. 
+jh <- jh %>% 
+  mutate(FIPS = ifelse(is.na(FIPS) & Admin2=="Dukes and Nantucket", 25007, FIPS)) %>%
+  mutate(FIPS = ifelse(is.na(FIPS) & Admin2=="Kansas City" & Province_State=="Missouri", 29000, FIPS))
+
+# Because we will use Dukes and Nantucket county, but Dukes County has the population data in the JH dataset, we will add that population count for Dukes and Nantucket. 
+
+jh <- jh %>% left_join(select(jh, FIPS, Admin2, date, Population) %>% 
+                               filter(FIPS == 25007 & Admin2 == "Dukes"), by = c("FIPS", "date"), suffix = c("", ".Dukes")) %>%
+  mutate(Population = ifelse(FIPS == 25007 & Admin2 == "Dukes and Nantucket", Population.Dukes, Population)) %>%
+  select (-c(Admin2.Dukes, Population.Dukes))
+
+```
+
+Note that we may need to pull population data from another source, as the JH population county for NYC seems off and I'm not sure where they are getting the population data from. 
+
+JH data has an "Unassigned" county for each state to capture cases and deaths not assigned to a county on the date the data was recorded. These seem to fluctuate as cases get assigned to counties later on. There is also an "Out of X", which I believe is assigned to people from another state who were treated in the given state. 
+
+The NYT data counts patients where they are treated, not necessarily where they are from. 
+
+```{r}
+# Sum total cases, deaths and get max (which should be for yesterday's total) for Unassigned counties and the "Out of State" designation. 
+
+jh_unknown <- jh %>%
+  filter(Admin2 == "Unassigned" | grepl("Out of", Admin2)) %>%
+  group_by(FIPS, Province_State, Admin2) %>%
+  summarise(sum_cases = sum(cases), sum_deaths = sum(deaths), max_cases = max(cases), max_deaths = max(deaths))
+
+```
+
+```{r}
+
+# Now remove all NA rows to trim dataset to established counties with FIPS + KC. 
+jh <- jh %>% drop_na()
+
+#Drop Dukes County, which has no data. Will just use "Dukes and Nantucket" with the correct FIPS code.
+# Drop Unassigned  and "Out of" counties. 
+
+jh <- jh %>%
+  filter(!(FIPS == 25007 & Admin2 == "Dukes")) %>%
+  filter(Admin2 != "Unassigned") %>%
+  filter(!grepl("Out of", Admin2))
+```
+
+From previous look, I also found out that NYT uses the full FIPS code including a leading zero for some  counties, which matches the census FIPS code, while JH drops the leading zero. Counties only have at most 1 leading zero. 
+
+```{r}
+# Add leading zero to all JH FIPS codes with only 4 digits and adjust date format to match NYT.
+jh <- jh %>% mutate(FIPS = as.character(ifelse(nchar(FIPS) == 4, paste0("0", FIPS), FIPS))
+                    , date = as.Date(date, format = "%m/%d/%y"))
+
+# Trim down the JH dataset to only the relevant columns and rename them.
+jh <- jh %>% select(UID, FIPS, full_name = Combined_Key, country = Country_Region, state = Province_State, county = Admin2, date
+                    , cases, deaths, population.jh = Population, lat = Lat, long = Long_) 
+
+```
+
+# End data checks and cleanup for JH data. 
+
+
+## NYT data exploration and cleanup
+```{r}
+head(nyt)
+
+```
+
+```{r}
+# Check missing values. 
+
+print(nyt %>% summarise_all(funs(sum(is.na(.)))), width = Inf)
+
+```
+
+```{r}
+# The only NA's are for fips. Check which counties these are associated with. 
+print(nyt %>% filter(is.na(fips)) %>%
+  group_by(state, county) %>%
+  summarise(count = n()), n= Inf) %>%
+  arrange(county)
+
+```
+
+There are a bunch of "Unknown" county names, plus KC and NYC. 
+
+```{r}
+# Hard code KC FIPS that we used for JH dataset and hard code NYC value. 
+nyt <- nyt %>% 
+  mutate(fips = ifelse(is.na(fips) & county=="New York City" & state=="New York", "36061", fips)) %>%
+  mutate(fips = ifelse(is.na(fips) & county=="Kansas City" & state=="Missouri", "29000", fips))
+
+```
+
+```{r}
+# Check to see if there are gaps in the dates for any counties. It should be that once cases start, we have continuous entries each day. 
+print(nyt %>% 
+  arrange(fips, state, county, date) %>%
+  mutate(date_gap = date - lag(date)) %>%
+  filter(date_gap > 1)
+  , n=Inf)
+
+```
+
+This is mostly an issue for the Unknown county counts, but there are a little over 40 counties with very low case totals (and no deaths) that seem to report a reversion to 0 total cases after reporting their first case and drop out of the dataset periodically. 
+
+It seems reasonable to interpolate these missing dates the same way we will interpolate other missing data or dropped outliers. 
+
+```{r}
+# Sum total cases, deaths and get max (which should be for yesterday's total) for Unkown counties.
+
+nyt_unknown <- nyt %>%
+  filter(county == "Unknown") %>%
+  group_by(state) %>%
+  summarise(sum_cases = sum(cases), sum_deaths = sum(deaths), max_cases = max(cases), max_deaths = max(deaths))
+  
+nyt_unknown %>% ungroup() %>% summarize(total_cases = sum(sum_cases), total_deaths = sum(sum_deaths), current_cases = sum(max_cases), current_deaths = sum(max_deaths))
+
+```
+
+Compare to JH Unassigned or Out of: 
+
+```{r}
+jh_unknown %>% ungroup() %>% summarize(total_cases = sum(sum_cases), total_deaths = sum(sum_deaths), current_cases = sum(max_cases), current_deaths = sum(max_deaths))
+
+```
+
+NYT has a bit more cases that were not assigned to a county at some point in the dataset, but fewer deaths not assigned to a specific county. 
+
+
+```{r}
+# Drop Unknown counties from NYT. 
+
+nyt <- nyt %>%
+  filter(county != "Unknown")
+```
+
+# End data checks and cleanup for CDS data. 
+
+
+## Join datasets
+
+```{r}
+# Check what's in NYT, but missing from JH. Summarize by county. 
+
+print(anti_join(nyt, jh, by = c("fips" = "FIPS" , "date")) %>%
+        group_by(county, state) %>% 
+        summarise(count = n(), cases = sum(cases), deaths = sum(deaths)) %>%
+        arrange(desc(count))
+      , n=Inf)
+```
+
+There's just one early date for Snohomish County in Washington, but otherwise every other entry for NYT is included in the county list and date range for JH. 
+
+```{r}
+# Check what's in JH, but not NYT. Only include entries with at least one case or death in the JH data. Only go up to two days ago because these datasets get updated at different times. 
+
+print(anti_join(jh %>% filter(cases+deaths >0), nyt, by = c("FIPS" = "fips", "date")) %>%
+        group_by(full_name) %>% 
+        filter(date < as.Date(Sys.Date()-1)) %>%
+        summarise(count = n(), cases = sum(cases), deaths = sum(deaths)) %>%
+        arrange(desc(cases)))
+
+```
+
+From scanning both datasets, it seems as though most of the discrepancies in RI and in general are due to NYT having Unknown listed as the county for early data, whereas JH already has those early cases attributed to specific counties. This may be a reason to use JH data, but it's not clear that it is necessarily actually more accurate. 
+
+```{r}
+# Join NYT data on FIPS and date. 
+df <- jh %>% left_join(select(nyt, fips, date, cases, deaths), by = c("FIPS" = "fips", "date"), suffix = c(".jh", ".nyt"))
+
+```
+
+
+Before joining the CDS data, need to do some manual cleanup of county names so that we can join on state and county, because we don't have FIPS. 
+
+```{r}
+county_header <- c(" County| Parish| Borough| Census Area| Municipality")
+
+cds <- cds %>%
+  mutate(county = ifelse(state == "Massachusetts" & county == "Dukes County", "Dukes and Nantucket", county)) %>%
+  
+  mutate(county = ifelse(state == "Alaska" & county == "Juneau City and Borough", "Juneau", county)) %>%
+  mutate(county = ifelse(state == "Alaska" & county == "Sitka City and Borough", "Sitka", county)) %>%
+  mutate(county = ifelse(state == "Alaska" & county == "Wrangell City and Borough", "Wrangell", county)) %>%
+  mutate(county = ifelse(state == "Alaska" & county == "Yakutat City and Borough", "Yakutat", county)) %>%
+  
+  mutate(county = ifelse(state == "Virginia" & county == "Charles City County", "Charles City", county)) %>%
+  mutate(county = ifelse(state == "Virginia" & county == "James City County", "James City", county)) %>%
+  
+  mutate(county = ifelse(state == "New Mexico" & county == "Doña Ana County", "Dona Ana", county)) %>%
+  
+  mutate(state = ifelse(state == "Washington, D.C." & county == "District of Columbia", "District of Columbia", state)) %>%
+  
+  mutate(county = ifelse(name %in% c("Baltimore City, Maryland, United States", "Carson City, Nevada, United States", "Charles City County, Virginia, United States"
+                                     , "Fairfax City, Virginia, United States", "Franklin City, Virginia, United States", "James City County, Virginia, United States"
+                                     , "Kansas City, Missouri, United States", "Richmond City, Virginia, United States", "Roanoke City, Virginia, United States"
+                                     , "St. Louis City, Missouri, United States"), county, str_remove_all(county, " City"))) %>%
+  
+  mutate(county = str_remove_all(county, county_header))
+
+```
+
+```{r}
+# Check what's in CDS, but missing from JH. Summarize by county: 
+print(anti_join(cds, df, by = c("state", "county", "date")) %>%
+        group_by(county, state) %>% 
+        summarise(count = n(), tests = sum(tested)) %>%
+        arrange(desc(count))
+      , n=Inf)
+
+```
+
+This looks good, we only have these aggregated county regions in Utah in the CDS dataset that are not in the NYT dataset and are called by different names in the JH dataset. 
+
+```{r}
+# Check what's in JH, but not CDS. Only include entries with at least one case or death in the JH data. Only go up to two days ago because these datasets get updated at different times. 
+
+print(anti_join(df %>% filter(cases.jh + deaths.jh >0), cds, by = c("state", "county", "date")) %>%
+        group_by(full_name) %>% 
+        filter(date < as.Date(Sys.Date()-1)) %>%
+        summarise(count = n()) %>%
+        arrange(desc(count))
+        )
+```
+
+CDS doesn't have KC separated out the way that JH and NYT do. 
+
+```{r}
+# Join CDS data to JH/NYT data. 
+df <- df %>% left_join(select(cds, county, state, date, cases.cds = cases, deaths.cds = deaths, tested.cds = tested, hospitalized.cds = hospitalized, recovered.cds = recovered)
+                              , by = c("state", "county", "date"), suffix = c("", ".cds"))
+
+```
+
+
+## Monotonicity checks
+The case, death, test data is all compiled as a running cumulative total. Therefore, those numbers should be monotonically increasing -- i.e., they should never decrease. Unfortunately, each dataset has instances where the numbers go down, in addition to missing data. 
+
+# CDS testing data check
+
+```{r}
+# Count total counties in dataset as a reference.
+n_county <- df %>% summarize(n_distinct(full_name))
+n_county
+```
+Note that this matches the Wikipedia count of 3,142 counties in the U.S. (excluding territories) + Kansas City. 
+
+```{r}
+# Count counties with testing data. 
+n_county_test <- df %>% 
+  filter(tested.cds > 0) %>%
+  summarize(n_distinct(full_name))
+
+n_county_test
+```
+
+```{r}
+# Check for instances of total tested in a county going down in CDS data. 
+
+cds_test_mono_check <- df %>%
+  group_by(full_name, state) %>%
+  arrange(full_name, date) %>%
+  mutate(lag_test = lag(tested.cds)) %>%
+  filter(lag_test > tested.cds & !is.na(tested.cds)) %>%
+  summarise(count = n()) %>%
+  arrange(state, desc(count))
+
+sum(cds_test_mono_check$count) 
+sum(cds_test_mono_check$count) / n_county_test
+
+```
+
+This is an issue with a little under 20% of counties with testing data. 
+
+```{r}
+# Check for instances of cases and deaths decreasing in JH data. 
+
+jh_case_mono_check <- df %>%
+  group_by(full_name, state) %>%
+  arrange(full_name, date) %>%
+  mutate(lag_cases = lag(cases.jh)) %>%
+  filter(lag_cases > cases.jh & !is.na(cases.jh)) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+
+jh_death_mono_check <- df %>%
+  group_by(full_name, state) %>%
+  arrange(full_name, date) %>%
+  mutate(lag_deaths = lag(deaths.jh)) %>%
+  filter(lag_deaths > deaths.jh & !is.na(deaths.jh)) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+sum(jh_case_mono_check$count) 
+sum(jh_death_mono_check$count) 
+
+sum(jh_case_mono_check$count) / n_county
+sum(jh_death_mono_check$count) / n_county
+
+```
+
+Around a third of counties have instances of cases decreasing and about 5% have instances of deaths decreasing. 
+
+```{r}
+# Check for instances of cases and deaths decreasing in NYT data. 
+nyt_case_mono_check <- df %>%
+  group_by(full_name, state) %>%
+  arrange(full_name, date) %>%
+  mutate(lag_cases = lag(cases.nyt)) %>%
+  filter(lag_cases > cases.nyt & !is.na(cases.nyt) & !grepl("Unassigned", county) & !grepl("Out of", county)) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+
+nyt_death_mono_check <- df %>%
+  group_by(full_name, state) %>%
+  arrange(full_name, date) %>%
+  mutate(lag_deaths = lag(deaths.nyt)) %>%
+  filter(lag_deaths > deaths.nyt & !is.na(deaths.nyt) & !grepl("Unassigned", county) & !grepl("Out of", county)) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+sum(nyt_case_mono_check$count)
+sum(nyt_death_mono_check$count)
+
+sum(nyt_case_mono_check$count) / n_county
+sum(nyt_death_mono_check$count) / n_county
+```
+
+For NYT, it's about 25% of counties for cases and a little less than 5% for deaths. 
+
+It seems that the advantages of the NYT data are: 
+- Fewer instances of day-to-day decreases 
+- We know that they allocate patients from another state treated in a specific place to that county's total when they have it, rather than listing it as "Out of State"
+
+The advantages of the JH data are: 
+- Cases for some places, such as RI, are immediately allocated to counties, whereas in NYT data those cases show up as Unknown county well into the outbreak
+- We don't have any missing data in the middle of the outbreak; for NYT, this seems to only be an issue early in the outbreak where case counts are very low, but it is still something to be aware of
+
+
+## Correcting decreasing data and imputing missing values
+
+This is a rough initial stab at throwing out potentially incorrect data leading to non-monotonically increasing counts. Missing data between two known values is then linearly interpolated. Missing data for NYT and CDS is assumed to be 0 for dates prior to the first recorded case, death, or test for a given county. Missing data at the end of the dataset for recent days is assumed to be the most recent recorded value -- i.e., I assume the current count is whatever the latest count available is and there have not been any new cases. 
+
+# Step by step process: 
+
+1. Determine if value for given date > most recent total. If so, drop that value. If we have an incorrect low total for the most recent value, this will throw out previous estimates. However, the hope is that the most recent data is the most accurate and that this issue will be taken care of when we rerun this in the future after data is retroactively corrected. Might consider making this something like whether value is > than yesterday's total. Note that we do not throw out data if the current total is missing. 
+
+2. Determine if value for given date > max value over next 5 days. If so, drop that value. Similar logic as 1, but this handles outlier high values that don't happen to be greater than the most recent total. There will be very few cases for which 1 is true and 2 is NOT true, but it is theoretically possible and the logic is that we should categorically throw out values that are greater than current total. 
+
+3. After dropping values for above two situations, drop any value that is < the max at any point up to that date. This handles the majority of situations: the assumed reason for a decrease in value is that an incorrectly LOW value was entered for a single day or string of days. 
+
+4. Linear interpolation of dropped values using the closest non-missing values. 
+
+5. Fill missing values at the front end of the dataset with 0. 
+
+6. Fill missing values at the tail end of the datset with the most recent value. 
+
+Given that our prior for cases and deaths is some form of logistic function, it may be better to fit a curve to the data to both identify outliers and interpolate missing data. That said, it's not clear to me how well this will work for these data errors or that this level of complexity is really necessary for this situation. 
+
+```{r}
+# Steps 1 to 3 to identify which values to throw out as likely errors. We will do this for JH / NYT cases and deaths, and for CDS tests. 
+
+df <- df %>%
+  group_by(FIPS, full_name) %>%
+  arrange(FIPS, full_name, date) %>%
+  
+  # Step 1: drop values > current total.
+  
+  # Set current values for each variable and a new _adj variable to save the new values for each, so   that we can preserve original data. 
+  mutate(current_cases_total.jh = cases.jh[which(date == max(date))]
+         , current_deaths_total.jh = deaths.jh[which(date == max(date))]
+         , cases_adj.jh = cases.jh
+         , deaths_adj.jh = deaths.jh
+         
+         , current_cases_total.nyt = cases.nyt[which(date == max(date))]
+         , current_deaths_total.nyt = deaths.nyt[which(date == max(date))]
+         , cases_adj.nyt = cases.nyt
+         , deaths_adj.nyt = deaths.nyt
+         
+         , current_tested_total.cds = tested.cds[which(date == max(date))]
+         , tested_adj.cds = tested.cds) %>%
+  
+  # Drop values meeting criteria. 
+  mutate(cases_adj.jh = ifelse(cases_adj.jh > current_cases_total.jh, NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh > current_deaths_total.jh, NA, deaths_adj.jh)
+         
+         , cases_adj.nyt = ifelse(cases_adj.nyt > current_cases_total.nyt, NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt > current_deaths_total.nyt, NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds > current_tested_total.cds, NA, tested_adj.cds)) %>%
+   # Step 2: drop values > max of next 5 days. 
+  
+   # Set max of next 5 days for each variable. 
+  mutate(max_cases_next5.jh = rollapply(cases_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.jh = rollapply(deaths_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_cases_next5.nyt = rollapply(cases_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.nyt = rollapply(deaths_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_tested_next5.cds = rollapply(tested_adj.cds, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)) %>%
+  
+  # Drop variables meeting criteria. We will cycle through each variable 5 times so that if there are strings over incorrectly high entries for multiple days in a row, we make sure to throw all of them out. 
+  # Pass 1
+  mutate(cases_adj.jh = ifelse(cases_adj.jh > max_cases_next5.jh & !is.na(max_cases_next5.jh), NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh > max_deaths_next5.jh & !is.na(max_deaths_next5.jh), NA, deaths_adj.jh)
+  
+         , cases_adj.nyt = ifelse(cases_adj.nyt > max_cases_next5.nyt & !is.na(max_cases_next5.nyt), NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt > max_deaths_next5.nyt & !is.na(max_deaths_next5.nyt), NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds > max_tested_next5.cds & !is.na(max_tested_next5.cds), NA, tested_adj.cds)) %>%
+  
+  # Pass 2 - recalculate max next 5. 
+  mutate(max_cases_next5.jh = rollapply(cases_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.jh = rollapply(deaths_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_cases_next5.nyt = rollapply(cases_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.nyt = rollapply(deaths_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_tested_next5.cds = rollapply(tested_adj.cds, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)) %>%
+  
+  # Pass 2 - drop values. 
+  mutate(cases_adj.jh = ifelse(cases_adj.jh > max_cases_next5.jh & !is.na(max_cases_next5.jh), NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh > max_deaths_next5.jh & !is.na(max_deaths_next5.jh), NA, deaths_adj.jh)
+         
+         , cases_adj.nyt = ifelse(cases_adj.nyt > max_cases_next5.nyt & !is.na(max_cases_next5.nyt), NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt > max_deaths_next5.nyt & !is.na(max_deaths_next5.nyt), NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds > max_tested_next5.cds & !is.na(max_tested_next5.cds), NA, tested_adj.cds)) %>%
+  
+  # Pass 3 - recalculate max next 5. 
+  mutate(max_cases_next5.jh = rollapply(cases_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.jh = rollapply(deaths_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_cases_next5.nyt = rollapply(cases_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.nyt = rollapply(deaths_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_tested_next5.cds = rollapply(tested_adj.cds, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)) %>%
+ 
+   # Pass 3 - drop values. 
+  mutate(cases_adj.jh = ifelse(cases_adj.jh > max_cases_next5.jh & !is.na(max_cases_next5.jh), NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh > max_deaths_next5.jh & !is.na(max_deaths_next5.jh), NA, deaths_adj.jh)
+         
+         , cases_adj.nyt = ifelse(cases_adj.nyt > max_cases_next5.nyt & !is.na(max_cases_next5.nyt), NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt > max_deaths_next5.nyt & !is.na(max_deaths_next5.nyt), NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds > max_tested_next5.cds & !is.na(max_tested_next5.cds), NA, tested_adj.cds)) %>%
+  
+  # Pass 4 - recalculate max next 5. 
+  mutate(max_cases_next5.jh = rollapply(cases_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.jh = rollapply(deaths_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_cases_next5.nyt = rollapply(cases_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.nyt = rollapply(deaths_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_tested_next5.cds = rollapply(tested_adj.cds, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)) %>%
+  
+  # Pass 4 - drop values. 
+  mutate(cases_adj.jh = ifelse(cases_adj.jh > max_cases_next5.jh & !is.na(max_cases_next5.jh), NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh > max_deaths_next5.jh & !is.na(max_deaths_next5.jh), NA, deaths_adj.jh)
+         
+         , cases_adj.nyt = ifelse(cases_adj.nyt > max_cases_next5.nyt & !is.na(max_cases_next5.nyt), NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt > max_deaths_next5.nyt & !is.na(max_deaths_next5.nyt), NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds > max_tested_next5.cds & !is.na(max_tested_next5.cds), NA, tested_adj.cds)) %>%
+  
+  # Pass 5 - recalculate max next 5. 
+  mutate(max_cases_next5.jh = rollapply(cases_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.jh = rollapply(deaths_adj.jh, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_cases_next5.nyt = rollapply(cases_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         , max_deaths_next5.nyt = rollapply(deaths_adj.nyt, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)
+         
+         , max_tested_next5.cds = rollapply(tested_adj.cds, list((1:5)), max, na.rm = TRUE, fill=NA, align="left", partial=TRUE)) %>%
+  
+  # Pass 5 - drop values. 
+  mutate(cases_adj.jh = ifelse(cases_adj.jh > max_cases_next5.jh & !is.na(max_cases_next5.jh), NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh > max_deaths_next5.jh & !is.na(max_deaths_next5.jh), NA, deaths_adj.jh)
+         
+         , cases_adj.nyt = ifelse(cases_adj.nyt > max_cases_next5.nyt & !is.na(max_cases_next5.nyt), NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt > max_deaths_next5.nyt & !is.na(max_deaths_next5.nyt), NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds > max_tested_next5.cds & !is.na(max_tested_next5.cds), NA, tested_adj.cds)) %>%
+  
+  # Step 3: drop values < previous max to date
+  # Set max to date. . 
+  mutate(max_cases_to_date.jh = cummax(ifelse(is.na(cases_adj.jh), -Inf, cases_adj.jh))
+         , max_deaths_to_date.jh = cummax(ifelse(is.na(deaths_adj.jh), -Inf, deaths_adj.jh))
+         
+         , max_cases_to_date.nyt = cummax(ifelse(is.na(cases_adj.nyt), -Inf, cases_adj.nyt))
+         , max_deaths_to_date.nyt = cummax(ifelse(is.na(deaths_adj.nyt), -Inf, deaths_adj.nyt))
+         
+         , max_tested_to_date.cds = cummax(ifelse(is.na(tested_adj.cds), -Inf, tested_adj.cds))) %>%
+  
+  # Drop values meeting criteria. 
+  mutate(cases_adj.jh = ifelse(cases_adj.jh < max_cases_to_date.jh, NA, cases_adj.jh)
+         , deaths_adj.jh = ifelse(deaths_adj.jh < max_deaths_to_date.jh, NA, deaths_adj.jh)
+         
+         , cases_adj.nyt = ifelse(cases_adj.nyt < max_cases_to_date.nyt, NA, cases_adj.nyt)
+         , deaths_adj.nyt = ifelse(deaths_adj.nyt < max_deaths_to_date.nyt, NA, deaths_adj.nyt)
+         
+         , tested_adj.cds = ifelse(tested_adj.cds < max_tested_to_date.cds, NA, tested_adj.cds))
+
+```
+
+```{r}
+# Linearly interpolate missing values in between two known values. 
+df <- df %>%
+  group_by(FIPS, full_name) %>%
+  arrange(FIPS, full_name, date) %>%
+  mutate(cases_adj.jh = floor(na.approx(cases_adj.jh, na.rm = FALSE))
+         , deaths_adj.jh = floor(na.approx(deaths_adj.jh, na.rm = FALSE))
+         
+         , cases_adj.nyt = floor(na.approx(cases_adj.nyt, na.rm = FALSE))
+         , deaths_adj.nyt = floor(na.approx(deaths_adj.nyt, na.rm = FALSE))
+         
+         , tested_adj.cds = floor(na.approx(tested_adj.cds, na.rm = FALSE)))
+
+```
+
+```{r}
+# Fill down missing entries at the end of the data with the most recent count that we have in the data. 
+df <- df %>%
+  group_by(FIPS, full_name) %>%
+  arrange(FIPS, full_name, date) %>%
+  fill(c(cases_adj.jh, deaths_adj.jh, cases_adj.nyt, deaths_adj.nyt, tested_adj.cds))
+```
+
+```{r}
+# Fill initial missing values up to first case, death, or test with 0. 
+
+df <- df %>%
+  mutate_at(vars(cases_adj.jh, deaths_adj.jh, cases_adj.nyt, deaths_adj.nyt, tested_adj.cds), ~replace_na(., 0))
+
+```
+
+## Compare NYT to JH
+
+Identify which counties have the largest discrepancies and most instances of a discrepancy in per capita cases and deaths between:
+1. NYT and JH adjusted values with interpolated data
+2. NYT and JH unadjusted values
+3. NYT raw values and NYT adjusted values
+4. Same for JH
+
+```{r}
+# Calculate differences in cases and deaths for situations mentioned. 
+df <- df %>%
+  mutate(cases_adj_diff = 100000*((cases_adj.jh - cases_adj.nyt)/population.jh)
+         , deaths_adj_diff = 100000*((deaths_adj.jh - deaths_adj.nyt)/population.jh)
+         , cases_diff = 100000*((cases.jh - ifelse(is.na(cases.nyt), 0, cases.nyt))/population.jh)
+         , deaths_diff = 100000*((deaths.jh - ifelse(is.na(deaths.nyt), 0, deaths.nyt))/population.jh)
+         , case_adjustment.jh = 100000*((cases_adj.jh - cases.jh)/population.jh)
+         , case_adjustment.nyt = 100000*((cases_adj.nyt - ifelse(is.na(cases.nyt), 0, cases.nyt))/population.jh)
+         , death_adjustment.jh = 100000*((deaths_adj.jh - deaths.jh)/population.jh)
+         , death_adjustment.nyt = 100000*((deaths_adj.nyt - ifelse(is.na(deaths.nyt), 0, deaths.nyt))/population.jh))
+
+# Aggregate by county to calculate the sum of all the discrepancies across dates, the max discrepancy (generally should correspend to whatever the latest value is for running total), and count instances where there is a discrepancy for each situation. 
+
+df_diff_county <- df %>% 
+  ungroup() %>%
+  group_by(FIPS, full_name, state, county) %>%
+  summarize(sum_cases_adj = sum(abs(cases_adj_diff))
+            , max_cases_adj = max(cases_adj_diff)
+            , sum_deaths_adj = sum(abs(deaths_adj_diff))
+            , max_deaths_adj = max(deaths_adj_diff)
+            
+            , count_cases_adj =  sum(cases_adj_diff != 0, na.rm = TRUE)
+            , count_deaths_adj =  sum(deaths_adj_diff != 0, na.rm = TRUE)
+            
+            , sum_cases = sum(abs(cases_diff))
+            , max_cases = max(cases_diff)
+            , sum_deaths = sum(abs(deaths_diff))
+            , max_deaths = max(deaths_diff)
+            
+            , count_cases =  sum(cases_diff != 0, na.rm = TRUE)
+            , count_deaths =  sum(deaths_diff != 0, na.rm = TRUE)
+            
+            , sum_case_adjustment.jh = sum(abs(case_adjustment.jh))
+            , max_case_adjustment.jh = max(case_adjustment.jh)
+            , sum_case_adjustment.nyt = sum(abs(case_adjustment.nyt))
+            , max_case_adjustment.nyt = max(case_adjustment.nyt)
+            
+            , count_case_adjustment.jh =  sum(case_adjustment.jh != 0, na.rm = TRUE)
+            , count_case_adjustment.nyt =  sum(case_adjustment.nyt != 0, na.rm = TRUE)
+            
+            , sum_death_adjustment.jh = sum(abs(death_adjustment.jh))
+            , max_death_adjustment.jh = max(death_adjustment.jh)
+            , sum_death_adjustment.nyt = sum(abs(death_adjustment.nyt))
+            , max_death_adjustment.nyt = max(death_adjustment.nyt)
+            
+            , count_death_adjustment.jh =  sum(death_adjustment.jh != 0, na.rm = TRUE)
+            , count_death_adjustment.nyt =  sum(death_adjustment.nyt != 0, na.rm = TRUE))
+  
+
+```
+
+First, let's just see what the aggregated differences are. 
+```{r}
+df %>%
+  ungroup() %>%
+  summarize(sum_cases_adj_diff = sum(cases_adj_diff) 
+            , sum_deaths_adj_diff = sum(deaths_adj_diff) 
+            
+            , sum_cases_diff = sum(cases_diff)
+            , sum_deaths_diff = sum(deaths_diff)
+            
+            , sum_case_adjustment.jh = sum(case_adjustment.jh)
+            , count_case_adjustment.jh = sum(case_adjustment.jh > 0, na.rm = TRUE)
+            
+            , sum_case_adjustment.nyt = sum(case_adjustment.nyt) 
+            , count_case_adjustment.nyt = sum(case_adjustment.nyt > 0, na.rm = TRUE)
+            
+            , sum_death_adjustment.jh = sum(death_adjustment.jh)
+            , count_death_adjustment_jh = sum(death_adjustment.jh >0, na.rm = TRUE)
+            
+            , sum_death_adjustment.nyt = sum(death_adjustment.nyt)
+            , count_death_adjustment_nyt = sum(death_adjustment.nyt >0, na.rm = TRUE))
+
+
+
+            
+```
+Overall, JH counts fewer cases and fewer deaths, both in the adjusted and unadjusted numbers, when aggregated over all dates. The actual current totals are the opposite from the current dashboards: JH counts more total cases in the US than NYT. Some of the differences over time may be based on how each dataset is allocating and updating cases/deaths to counties vs. the unknown bucket. 
+
+There were more adjustments made to account for incorrect data for the JH data and these adjusted those counts down more than they did for NYT data. 
+
+Plot cases and deaths for the two datasets against each other, assuming they should be very close matches. 
+
+```{r}
+# Plot and correlate cases_adj, deaths_adj  for JH and NYT. 
+
+qplot(x=cases_adj.jh, y=cases_adj.nyt, data=df)
+
+cases_adj_lm <- lm(cases_adj.jh ~ cases_adj.nyt , data = df)
+summary(cases_adj_lm)
+
+```
+As expected -- the case data maps very closely, with JH cases slightly lower overall than NYT data. 
+
+```{r}
+
+qplot(x=deaths_adj.jh, y=deaths_adj.nyt, data=df)
+
+deaths_adj_lm <- lm(deaths_adj.jh ~ deaths_adj.nyt , data = df)
+summary(deaths_adj_lm)
+```
+Adjusted deaths counts do not fit quite as well at the high end in NYC where JH data is noticeably higher than NYT. 
+
+```{r}
+# Same process for unadjusted counts. 
+qplot(x=deaths.jh, y=deaths.nyt, data = df)
+
+deaths_lm <- lm(deaths.jh ~ deaths.nyt , data = df)
+summary(deaths_lm)
+```
+
+This is generally a function of the underlying unadjusted data, not something having to with the adjustment process. 
+
+
+# Differences by county
+
+```{r}
+# Check which counties have the most instances of a discrepancy between JH and NYT deaths data.  
+df_diff_county %>% 
+  arrange(desc(count_deaths_adj)) %>%
+  select(FIPS, state, full_name, count_deaths_adj, sum_deaths_adj, max_deaths_adj)
+```
+
+It looks like some Washington counties have a lot of discrepancies between the two datasets, then there are a fare number of differences across NY, which makes sense because the case numbers are larger in these places. 
+
+```{r}
+# Check which counties have the largest aggregated discrepancy between JH and NYT deaths data.  
+df_diff_county %>% 
+  arrange(desc(sum_deaths_adj)) %>%
+  select(FIPS, state, full_name, count_deaths_adj, sum_deaths_adj, max_deaths_adj)
+```
+
+The largest aggregated absolute differences are, for the most part, in NY where the counts are the highest. 
+
+I want to see what this data looks like for a handful of counties of interest. 
+
+```{r}
+# Plot death total for NYT and JH over time in: NYC; Nassau, NY; King, WA; Davison, SD; Terrell, GA; Santa Clara, CA
+
+county_list <- c("New York City, New York, US", "Nassau, New York, US", "Davison, South Dakota, US", "Terrell, Georgia, US", "King, Washington, US", "Santa Clara, California, US")
+county_deaths_plot = list()
+for(i in 1:length(county_list)) {
+p <- df %>% 
+  filter(full_name == county_list[i]) %>%
+  ggplot() +
+  
+  geom_line(aes(x=date, y=100000*(deaths_adj.nyt/population.jh), group=full_name, color="deaths_adj.nyt")) + 
+  geom_line(aes(x=date, y=100000*(deaths_adj.jh/population.jh), group=full_name, color="deaths_adj.jh")) + 
+  
+  labs(title=paste("Deaths per 100k by Data Source:", county_list[i]), y="Deaths per 100k")
+county_deaths_plot[[i]] = p
+}
+county_deaths_plot
+```
+
+Anecdotally, these still track each other reasonably well except for the large discrepancy in NYC. Maybe JH is allocating more deaths to the city and NYT is allocating more to surrounding counties? 
+
+Run the same process for case counts. 
+
+```{r}
+# Check which counties have the most instances of a discrepancy between JH and NYT cases data.  
+df_diff_county %>% 
+  arrange(desc(count_cases_adj)) %>%
+  select(FIPS, state, full_name, count_cases_adj, sum_cases_adj, max_cases_adj)
+```
+
+```{r}
+# Check which counties have the largest aggregated discrepancy between JH and NYT cases data.  
+df_diff_county %>% 
+  arrange(desc(sum_cases_adj)) %>%
+  select(FIPS, state, full_name, count_cases_adj, sum_cases_adj, max_cases_adj)
+```
+Another note on Dukes and Nantucket here: 
+- NYT has a Dukes County and a separate Nantucket County, with data for both
+- The raw JH data has Dukes (all 0's for cases, deaths and was thrown out), Nantucket (all 0's, but we kept it in), Dukes and Nantucket (the one we kept and added FIPS for, which has fairly accurate combined counts)
+
+It looks like the census data has these as two separate counties with separate FIPS, which is another point in favor of NYT. 
+
+
+```{r}
+# Plot case total for NYT and JH over time in: King, WA; SF; SD; Douglas, NE; Blaine, ID; Orange, NY
+
+county_list <- c( "King, Washington, US", "San Francisco, California, US",  "San Diego, California, US", "Douglas, Nebraska, US" , "Blaine, Idaho, US")
+county_cases_plot = list()
+for(i in 1:length(county_list)) {
+p <- df %>% 
+  filter(full_name == county_list[i]) %>%
+  ggplot() +
+  
+  geom_line(aes(x=date, y=100000*(cases_adj.nyt/population.jh), group=full_name, color="cases_adj.nyt")) + 
+  geom_line(aes(x=date, y=100000*(cases_adj.jh/population.jh), group=full_name, color="cases_adj.jh")) + 
+  
+  labs(title=paste("Cases per 100k by Data Source:", county_list[i]), y="Cases per 100k")
+county_cases_plot[[i]] = p
+}
+county_cases_plot
+```
+SF data starts later for JH, but ends up being almost identical. All of these plots generally track each other reasonaby well. 
+
+
+## Suggestion
+
+Digging into the NYC data in more detail might be useful down the road. Overall, the NYT data seems like it is a little bit more conservative. Initial cases for a county may start a bit later in places, but then have fewer weird decreases that need to get fixed. I would lean this direction, though we may need to be aware that the start date of cases may be artificially too late. This probably is not as big of a deal if we are defining the "start date" as the date where we pass a threshold of X cases or deaths, thereby ignoring those very early small case count days. 
+
+
+
+
+
+```
+
